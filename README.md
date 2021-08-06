@@ -1,7 +1,8 @@
-一个基于CAS的无锁共享内存队列的实现，使用fifo进行通知。OIDB分set实现的核心组件，已经在OIDB 600台机器稳定运行了近一年时间，为OIDB节省了150多台机器。
+**[中文描述]**
+一个基于CAS的无锁共享内存队列的实现，使用fifo进行事件通知，消费方可以同时轮询网络socket FD和队列生成的FIFO FD，满足实时性的消费需求。
 
  **特点**：
-  -   1，高性能，800w/s以上；
+  -   1，高性能，实测800w/s以上；
   -   2，实时通知，可用epoll侦听；
   -   3，高并发，支持同时多写多读。
 
@@ -14,8 +15,10 @@
   -   6，使用分块存储策略，便于高性能访问；
   -   7，发现错误块时跳过错误的块，快速自动恢复；
 
+**[English Description]**
+This is a very fast lock-free generic data queue implemented based on share memory (shm), it is lock-free so that multiple writers and readers can access the same queue synchronously without need of locking.
 
-**使用方法**
+**Usage example**
 
 ```C
 //
