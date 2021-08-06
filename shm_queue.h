@@ -3,7 +3,7 @@
  * Declaration of a shm queue
  *
  *  Created on: 2014-5-5
- *      Author: Shaneyu <shaneyu@tencent.com>
+ *      Author: Yu zhenshen <crazyshane@sina.com>
  *
  *  Based on transaction pool, features:
  *  1) support single writer but multiple reader processes/threads
