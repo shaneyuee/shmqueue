@@ -1,12 +1,15 @@
 **[中文描述]**
+
 一个基于CAS的无锁共享内存队列的实现，使用fifo进行事件通知，消费方可以同时轮询网络socket FD和队列生成的FIFO FD，满足实时性的消费需求。
 
  **特点**：
+ 
   -   1，高性能，实测800w/s以上；
   -   2，实时通知，可用epoll侦听；
   -   3，高并发，支持同时多写多读。
 
  **主要功能**：
+ 
   -   1，高性能访问，读写可以达到解决访问内存的性能；
   -   2，高并发访问，无锁解决读写、读读、写写冲突；
   -   3，带fifo fd通知，可以select或epoll通知句柄；
@@ -16,6 +19,7 @@
   -   7，发现错误块时跳过错误的块，快速自动恢复；
 
 **[English Description]**
+
 This is a very fast lock-free generic data queue implemented based on share memory (shm), it is lock-free so that multiple writers and readers can access the same queue synchronously without need of locking.
 
 **Usage example**
