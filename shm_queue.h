@@ -36,29 +36,41 @@ typedef unsigned short u16_t;
 typedef unsigned int u32_t;
 typedef unsigned long long u64_t;
 
-// Maximum bytes allowed for a queue data
-#define MAX_SQ_DATA_LENGTH	65536
+// Maximum bytes of data allowed for sq_put()
+// This is for validatation checking only, if your business data
+// is larger than this, please adjust this macro to fit your project
+#define MAX_SQ_DATA_LENGTH	(32*1024*1024)
 
-// number of blocks that will be reserved to avoid write-read conflict
+// Number of blocks that will be reserved to avoid write-read conflict
 // if your project restricts the use of memory, you can adjust this number
-// down to 1, but the probabily of write-read conflict will also be increased
-#define RESERVE_BLOCK_COUNT	100
+// down to 1, but the probability of write-read conflict will also be increased
+#define RESERVE_BLOCK_COUNT	10
 
 struct shm_queue;
 
 // Create a shm queue
 // Parameters:
-//     shm_key      - shm key
+//     shm_key      - shm key, may be IPC_PRIVATE for anonymous shm
 //     ele_size     - preallocated size for each element
 //     ele_count    - preallocated number of elements, this count should be greater than RESERVE_BLOCK_COUNT,
 //                    and the real usable element count is (ele_count-RESERVE_BLOCK_COUNT)
 //     sig_ele_num  - only send signal when data element count exceeds sig_ele_num
 //     sig_proc_num - send signal to up to this number of processes each time
-// Returns a shm queue pointer or NULL if failed
+// Returns a shm queue pointer or NULL if failed, on failure, call sq_errorstr(NULL) to retrieve the reason.
 struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_ele_num, int sig_proc_num);
 
 // Open an existing shm queue for reading data
 struct shm_queue *sq_open(u64_t shm_key);
+
+// For anonymous shm, two processes can communicate throught shm_id,
+// please follow these steps:
+//   1) One process (A) creates a queue by sq_create() with key=IPC_PRIVATE
+//   2) A gets shm_id by sq_get_shmid()
+//   3) A transfers shm_id to another process (B)
+//   4) B opens the shm_queue by sq_open_by_shmid()
+//   5) Now A and B can communicate by each shm_queue pointer
+int sq_get_shmid(struct shm_queue *sq);
+struct shm_queue *sq_open_by_shmid(int shm_id);
 
 
 // Register the current process ID, so that it will be able to recived event by
@@ -91,8 +103,10 @@ int sq_consume_event_ext(struct shm_queue *sq, int nr_events);
 int sq_sigon(struct shm_queue *sq);
 int sq_sigoff(struct shm_queue *sq);
 
-// Destroy queue created by sq_create()
+// Destroy queue created by sq_create(), data in shm is left untouched
 void sq_destroy(struct shm_queue *queue);
+// Destroy shm_queue and remove shm
+void sq_destroy_and_remove(struct shm_queue *queue);
 
 // Add data to end of shm queue
 // this function is multi-thread/multi-process safe

@@ -41,7 +41,7 @@
 #define REGET_TIME_US_TIME   1
 #define CPU_SPEED_GB    1  // assume a 1GB CPU
 
-static inline int opt_gettimeofday(struct timeval *tv, __timezone_ptr_t not_used)
+static inline int opt_gettimeofday(struct timeval *tv, void *restrict not_used)
 {
 	static volatile uint64_t walltick;
 	static volatile struct timeval walltime;

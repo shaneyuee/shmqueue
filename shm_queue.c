@@ -11,6 +11,7 @@
  *  2014-07-05		shaneyu		Add registration/signal support
  *  2014-07-15  	shaneyu		Use fifo for data notification
  *  2014-07-21		shaneyu		Resolve multiple write conflicts
+ *  2022-10-31		shaneyu		Add anonymous shm support
  */
 #include <stdint.h>
 #include <sys/time.h>
@@ -28,7 +29,12 @@
 #include <unistd.h>
 #include <sys/file.h>
 #include "shm_queue.h"
+#if defined(__x86_64__) || defined(__x86_32__)
 #include "opt_time.h"
+#else
+#define opt_gettimeofday gettimeofday
+#define opt_time time
+#endif
 
 #define TOKEN_NO_DATA    0
 #define TOKEN_SKIPPED    0xdb030000 // token to mark the node is skipped
@@ -37,10 +43,15 @@
 #define SQ_MAX_READER_PROC_NUM	64 // maximum allowable processes to be signaled when data arrives
 #define SQ_MAX_CONFLICT_TRIES	10 // maximum number of reading attempts for read-write conflict detection
 
+#ifdef __x86_64__
 #define CAS32(ptr, val_old, val_new)({ char ret; __asm__ __volatile__("lock; cmpxchgl %2,%0; setz %1": "+m"(*ptr), "=q"(ret): "r"(val_new),"a"(val_old): "memory"); ret;})
 #define wmb() __asm__ __volatile__("sfence":::"memory")
 #define rmb() __asm__ __volatile__("lfence":::"memory")
-
+#else
+#define CAS32(ptr, val_old, val_new) __sync_bool_compare_and_swap(ptr, val_old, val_new)
+#define wmb() __sync_synchronize()
+#define rmb() __sync_synchronize()
+#endif
 struct sq_head_t;
 
 //
@@ -49,17 +60,12 @@ struct sq_head_t;
 // the writer compiled in 32bit can comunicate with the reader
 // in 64bit environment, and vice versa.
 //
-#ifdef __x86_64__
 #define time32_t int32_t
 struct timeval32
 {
 	time32_t tv_sec;
 	time32_t tv_usec;
 };
-#else
-#define time32_t time_t
-#define timeval32 timeval
-#endif
 
 struct shm_queue
 {
@@ -70,6 +76,7 @@ struct shm_queue
 	time32_t fifo_times[SQ_MAX_READER_PROC_NUM]; // fifo creation timestamps
 	uint64_t shm_key;
 	int rw_conflict; // read-write conflict counter
+	int shm_id;
 	char errmsg[256];
 };
 
@@ -143,10 +150,6 @@ struct sq_head_t
 // Estimate how many nodes are needed by this length
 #define SQ_NUM_NEEDED_NODES(queue, datalen) 	((datalen) + sizeof(struct sq_node_head_t) + SQ_NODE_SIZE(queue) -1) / SQ_NODE_SIZE(queue)
 
-
-// optimized gettimeofday
-#include "opt_time.h"
-
 static inline int is_pid_valid(pid_t pid)
 {
 	if(pid==0) return 0;
@@ -203,6 +206,12 @@ int sq_sigoff(struct shm_queue *sq)
 		return -1;
 	}
 	return 0;
+}
+
+int sq_get_shmid(struct shm_queue *sq)
+{
+	if (sq == NULL) return -1;
+	return sq->shm_id;
 }
 
 
@@ -358,12 +367,16 @@ int sq_consume_event_ext(struct shm_queue *sq, int nr_events)
 }
 
 // shm operation wrapper
-static char *attach_shm(long iKey, long iSize, int *bCreate)
+static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 {
-	int shmid, creating = *bCreate, created = 0;
+	int shmid = 0, creating = *bCreate, created = 0;
 	char* shm;
 
-	if((shmid=shmget(iKey, 0, 0)) < 0)
+	// If *pShmId is valid, use it
+	if(pShmId && *pShmId > 0)
+		shmid = *pShmId;
+
+	if(shmid==0 && (shmid=shmget(iKey, 0, 0)) < 0)
 	{
 		printf("shmget(key=%ld, size=%ld): %s\n", iKey, iSize, strerror(errno));
 		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0)
@@ -405,10 +418,12 @@ static char *attach_shm(long iKey, long iSize, int *bCreate)
 		return NULL;
 	}
 
+	if (pShmId && shmid != *pShmId)
+		*pShmId = shmid;
 	*bCreate = created;
 
 /*
-	// avoid swapping
+	// avoid swapping, need root privillege
 	if(mlock(shm, iSize)<0)
 	{
 		perror("mlock");
@@ -420,7 +435,7 @@ static char *attach_shm(long iKey, long iSize, int *bCreate)
 }
 
 // shm operation wrapper
-static struct sq_head_t *open_shm_queue(long shm_key, long ele_size, long ele_count, int create)
+static struct sq_head_t *open_shm_queue(long shm_key, long ele_size, long ele_count, int create, int *shm_id)
 {
 	long allocate_size;
 	struct sq_head_t *shm;
@@ -440,7 +455,7 @@ static struct sq_head_t *open_shm_queue(long shm_key, long ele_size, long ele_co
 	}
 
 	int created = create;
-	if (!(shm = (struct sq_head_t *)attach_shm(shm_key, allocate_size, &created)))
+	if (!(shm = (struct sq_head_t *)attach_shm(shm_key, allocate_size, &created, shm_id)))
 	{
 		return NULL;
 	}
@@ -527,7 +542,7 @@ static int exc_lock(int iUnlocking, int *fd, u64_t shm_key)
 
 // Create a shm queue
 // Parameters:
-//     shm_key      - shm key
+//     shm_key      - shm key, may be IPC_PRIVATE
 //     ele_size     - preallocated size for each element
 //     ele_count    - preallocated number of elements
 //     sig_ele_num  - only send signal when data element count exceeds sig_ele_num
@@ -548,7 +563,7 @@ struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_
 		return NULL;
 	}
 
-	if(ele_size<=0 || ele_count<=RESERVE_BLOCK_COUNT || shm_key<=0) // invalid parameter
+	if(ele_size<=0 || ele_count<=RESERVE_BLOCK_COUNT || shm_key<0) // invalid parameter
 	{
 		free(queue);
 		if(ele_count<=RESERVE_BLOCK_COUNT)
@@ -560,7 +575,8 @@ struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_
 	}
 
 	queue->shm_key = shm_key;
-	queue->head = open_shm_queue(shm_key, ele_size, ele_count, 1);
+	queue->shm_id = 0;
+	queue->head = open_shm_queue(shm_key, ele_size, ele_count, 1, &queue->shm_id);
 	if(queue->head==NULL)
 	{
 		free(queue);
@@ -587,7 +603,8 @@ struct shm_queue *sq_open(u64_t shm_key)
 	}
 	queue->shm_key = shm_key;
 	queue->sig_idx = -1;
-	queue->head = open_shm_queue(shm_key, 0, 0, 0);
+	queue->shm_id = 0;
+	queue->head = open_shm_queue(shm_key, 0, 0, 0, &queue->shm_id);
 	if(queue->head==NULL)
 	{
 		free(queue);
@@ -597,12 +614,45 @@ struct shm_queue *sq_open(u64_t shm_key)
 	return queue;
 }
 
-// Destroy TP created by sq_create()
+struct shm_queue *sq_open_by_shmid(int shm_id)
+{
+	signal(SIGPIPE, SIG_IGN);
+
+	struct shm_queue *queue = calloc(1, sizeof(struct shm_queue));
+	if(queue==NULL)
+	{
+		snprintf(errmsg, sizeof(errmsg), "Out of memory");
+		return NULL;
+	}
+	queue->shm_key = 0;
+	queue->sig_idx = -1;
+	queue->shm_id = shm_id;
+	queue->head = open_shm_queue(0, 0, 0, 0, &queue->shm_id);
+	if(queue->head==NULL)
+	{
+		free(queue);
+		snprintf(errmsg, sizeof(errmsg), "Open shm failed");
+		return NULL;
+	}
+	return queue;
+}
+
+
+// Destroy shm_queue created by sq_create()
 void sq_destroy(struct shm_queue *queue)
 {
 	shmdt(queue->head);
 	free(queue);
 }
+
+// Destroy shm_queue and remove shm
+void sq_destroy_and_remove(struct shm_queue *queue)
+{
+	shmdt(queue->head);
+	shmctl(queue->shm_id, IPC_RMID, 0);
+	free(queue);
+}
+
 
 static int signal_process(struct shm_queue *sq, int sigidx)
 {
@@ -710,14 +760,10 @@ int sq_put(struct shm_queue *sq, void *data, int datalen)
 
 		// initialize the new node
 		node->datalen = datalen;
-#ifdef __x86_64__
 		struct timeval tv;
 		opt_gettimeofday(&tv, NULL);
 		node->enqueue_time.tv_sec = tv.tv_sec;
 		node->enqueue_time.tv_usec = tv.tv_usec;
-#else
-		opt_gettimeofday(&node->enqueue_time, NULL);
-#endif
 		memcpy(node->data, data, datalen);
 		node->start_token = TOKEN_HAS_DATA; // mark data ready for reading
 		wmb(); // sync write with other processors
