@@ -43,9 +43,9 @@
 
 static inline int opt_gettimeofday(struct timeval *tv, void *restrict not_used)
 {
-	static volatile uint64_t walltick;
-	static volatile struct timeval walltime;
-	static volatile long lock = 0;
+	static __thread volatile uint64_t walltick;
+	static __thread volatile struct timeval walltime;
+	static __thread volatile long lock = 0;
 	const unsigned int max_ticks = CPU_SPEED_GB*1000*REGET_TIME_US_GTOD;
 	
 	if(walltime.tv_sec==0 || (RDTSC()-walltick) > max_ticks)
@@ -68,9 +68,9 @@ static inline int opt_gettimeofday(struct timeval *tv, void *restrict not_used)
 // same algorithm with gettimeofday, except with different precision defined as REGET_TIME_US_TIME
 static inline time_t opt_time(time_t *t)
 {
-	static volatile uint64_t walltick;
-	static volatile struct timeval walltime;
-	static volatile long lock = 0;
+	static __thread volatile uint64_t walltick;
+	static __thread volatile struct timeval walltime;
+	static __thread volatile long lock = 0;
 	const unsigned int max_ticks = CPU_SPEED_GB*1000*REGET_TIME_US_TIME;
 	
 	if(walltime.tv_sec==0 || (RDTSC()-walltick) > max_ticks)

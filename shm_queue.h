@@ -41,9 +41,10 @@ typedef unsigned long long u64_t;
 // is larger than this, please adjust this macro to fit your project
 #define MAX_SQ_DATA_LENGTH	(32*1024*1024)
 
-// Number of blocks that will be reserved to avoid write-read conflict
+// number of blocks that will be reserved to avoid write-after-read conflict
 // if your project restricts the use of memory, you can adjust this number
-// down to 1, but the probability of write-read conflict will also be increased
+// down to 1, but the probabily of write-read conflict will also be increased
+// it is strongly recommended that RESERVE_BLOCK_COUNT*ele_size > MAX_SQ_DATA_LENGTH
 #define RESERVE_BLOCK_COUNT	10
 
 struct shm_queue;

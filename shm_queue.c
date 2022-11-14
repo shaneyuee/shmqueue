@@ -43,7 +43,7 @@
 #define SQ_MAX_READER_PROC_NUM	64 // maximum allowable processes to be signaled when data arrives
 #define SQ_MAX_CONFLICT_TRIES	10 // maximum number of reading attempts for read-write conflict detection
 
-#ifdef __x86_64__
+#if defined(__x86_64__) || defined(__x86_32__)
 #define CAS32(ptr, val_old, val_new)({ char ret; __asm__ __volatile__("lock; cmpxchgl %2,%0; setz %1": "+m"(*ptr), "=q"(ret): "r"(val_new),"a"(val_old): "memory"); ret;})
 #define wmb() __asm__ __volatile__("sfence":::"memory")
 #define rmb() __asm__ __volatile__("lfence":::"memory")
@@ -75,7 +75,7 @@ struct shm_queue
 	int poll_fdset[SQ_MAX_READER_PROC_NUM]; // fd list of registered processes, writting
 	time32_t fifo_times[SQ_MAX_READER_PROC_NUM]; // fifo creation timestamps
 	uint64_t shm_key;
-	int rw_conflict; // read-write conflict counter
+	uint64_t rw_conflict_time; // time duration when conflict occurs
 	int shm_id;
 	char errmsg[256];
 };
@@ -378,9 +378,9 @@ static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 
 	if(shmid==0 && (shmid=shmget(iKey, 0, 0)) < 0)
 	{
-		printf("shmget(key=%ld, size=%ld): %s\n", iKey, iSize, strerror(errno));
-		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0)
+		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0 || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0)
 		{
+			printf("shmget(key=%ld, size=%ld, create=%d): %s\n", iKey, iSize, creating, strerror(errno));
 			return NULL;
 		}
 		created = 1;
@@ -580,7 +580,7 @@ struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_
 	if(queue->head==NULL)
 	{
 		free(queue);
-		snprintf(errmsg, sizeof(errmsg), "Get shm failed");
+		snprintf(errmsg, sizeof(errmsg), "Get shm failed - %s", strerror(errno));
 		exc_lock(1, &fd, shm_key); // ulock
 		return NULL;
 	}
@@ -608,7 +608,7 @@ struct shm_queue *sq_open(u64_t shm_key)
 	if(queue->head==NULL)
 	{
 		free(queue);
-		snprintf(errmsg, sizeof(errmsg), "Open shm failed");
+		snprintf(errmsg, sizeof(errmsg), "Open shm failed: %s", strerror(errno));
 		return NULL;
 	}
 	return queue;
@@ -631,7 +631,7 @@ struct shm_queue *sq_open_by_shmid(int shm_id)
 	if(queue->head==NULL)
 	{
 		free(queue);
-		snprintf(errmsg, sizeof(errmsg), "Open shm failed");
+		snprintf(errmsg, sizeof(errmsg), "Open shm failed: %s", strerror(errno));
 		return NULL;
 	}
 	return queue;
@@ -830,13 +830,14 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 		{
 			if(head!=old_head && CAS32(&queue->head_pos, old_head, head))
 			{
+				fprintf(stderr, "shmqueue empty after skipping!!\n");
 				wmb();
 				new_head = head;
 				datalen = 0;
 				break;
 			}
 			// head_pos not advanced or changed by someone else, simply returns
-			sq->rw_conflict = 0;
+			sq->rw_conflict_time = 0;
 			return 0;
 		}
 
@@ -844,24 +845,33 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 		if(node->start_token!=TOKEN_HAS_DATA) // read-write conflict or corruption of data
 		{
 			// if read-write conflict happens, we (the reader) will
-			// try at most SQ_MAX_CONFLICT_TRIES times for the
+			// try at most SQ_MAX_CONFLICT_TIME_MS time duration for the
 			// writer to finish, and if the writer is unable to
-			// finish in SQ_MAX_CONFLICT_TRIES consecutive reads,
+			// finish in SQ_MAX_CONFLICT_TIME_MS,
 			// we will treat it as node corruption
-			if(node->start_token==TOKEN_NO_DATA && sq->rw_conflict<SQ_MAX_CONFLICT_TRIES)
+			if(node->start_token!=TOKEN_SKIPPED)
 			{
-				// Attension:
-				// this node may have been read by some other process,
-				// if so, the header position should have been updated
-				rmb();
-				if(old_head!=queue->head_pos)
+				struct timeval tv = {0, 0};
+				opt_gettimeofday(&tv, NULL);
+				uint64_t now_ms = ((uint64_t)tv.tv_sec)*1000 + tv.tv_usec/1000;
+				if(sq->rw_conflict_time == 0)
+					sq->rw_conflict_time = now_ms;
+				if(now_ms < sq->rw_conflict_time + SQ_MAX_CONFLICT_TIME_MS)
 				{
-					// read by others, start all over again
-					head = old_head = queue->head_pos;
-					continue;
+					// Attension:
+					// this node may have been read by some other process,
+					// if so, the header position should have been updated
+					rmb();
+					if(old_head!=queue->head_pos)
+					{
+						fprintf(stderr, "shmqueue read by others!!\n");
+						// read by others, start all over again
+						sq->rw_conflict_time = 0;
+						head = old_head = queue->head_pos;
+						continue;
+					}
+					return 0; // returns no data
 				}
-				sq->rw_conflict++;
-				return 0; // returns no data
 			}
 			// check start_token once again in case the writer may have already finished writting for now
 			// in this case, we should not deem it corrupted
@@ -869,6 +879,9 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 			rmb();
 			if(node->start_token!=TOKEN_HAS_DATA)
 			{
+				if(node->start_token!=TOKEN_SKIPPED)
+					fprintf(stderr, "shmqueue data corrupted: unrecovered conflict!!\n");
+				sq->rw_conflict_time = 0;
 				// treat it as data corruption and skip this corrupted node
 				head = SQ_ADD_POS(queue, head, 1);
 				continue;
@@ -878,24 +891,33 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 		nr_nodes = SQ_NUM_NEEDED_NODES(queue, datalen);
 		if(SQ_USED_NODES2(queue, head) < nr_nodes)
 		{
+			fprintf(stderr, "shmqueue data corrupted: invalid length metadata!!\n");
+			sq->rw_conflict_time = 0;
 			head = SQ_ADD_POS(queue, head, 1);
 			continue;
 		}
+
+		// read data from queue
+		// must be done before CAS operation, so that when CAS finishes,
+		// some one else may safely write to it.
+		if(enqueue_time)
+		{
+			enqueue_time->tv_sec = node->enqueue_time.tv_sec;
+			enqueue_time->tv_usec = node->enqueue_time.tv_usec;
+		}
+		if(datalen > buf_sz)
+		{
+			snprintf(sq->errmsg, sizeof(sq->errmsg), "Data length(%u) exceeds supplied buffer size of %u", datalen, buf_sz);
+			fprintf(stderr, "shmqueue bad parameter: %s\n", sq->errmsg);
+			sq->rw_conflict_time = 0;
+			return -2;
+		}
+		memcpy(buf, node->data, datalen);
+
 		new_head = SQ_ADD_POS(queue, head, nr_nodes);
 		if(CAS32(&queue->head_pos, old_head, new_head))
 		{
 			wmb();
-			if(enqueue_time)
-			{
-				enqueue_time->tv_sec = node->enqueue_time.tv_sec;
-				enqueue_time->tv_usec = node->enqueue_time.tv_usec;
-			}
-			if(datalen > buf_sz)
-			{
-				snprintf(sq->errmsg, sizeof(sq->errmsg), "Data length(%u) exceeds supplied buffer size of %u", datalen, buf_sz);
-				return -2;
-			}
-			memcpy(buf, node->data, datalen);
 			break;
 		}
 		else // head_pos changed by someone else, start over
@@ -905,225 +927,21 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 		}
 	} while(1);
 
+	// FIXME: read-write conflict alert
+	//   writting after CAS is dangerous, because semeone may be just writing to the same node,
+	//   causing data to be currupted.
+	//   the only solution for now is to reserve enough space at the writing end, the developer
+	//   is responsible for keeping RESERVE_BLOCK_COUNT*ele_size > MAX_SQ_DATA_LENGTH
 	while(old_head!=new_head)
 	{
 		node = SQ_GET(queue, old_head);
 		// reset start_token so that this node will not be treated as a starting node of data
-		node->start_token = 0;
+		node->start_token = TOKEN_NO_DATA;
 		old_head = SQ_ADD_POS(queue, old_head, 1);
 	}
 
 	wmb();
-	sq->rw_conflict = 0;
+	sq->rw_conflict_time = 0;
 	return datalen;
 }
 
-#if SQ_FOR_TEST
-
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <ctype.h>
-
-//
-// Below is a test program, please compile with:
-// gcc -o sqtest -DSQ_FOR_TEST shm_queue.c
-//
-
-static char m[1024*1024];
-
-void test_put(struct shm_queue *queue, int proc_count, int count, char *msg)
-{
-	int i;
-	int pid = 0;
-
-	for(i=1; i<=proc_count; i++)
-	{
-		if(fork()==0)
-		{
-			pid=i;
-			break;
-		}
-	}
-
-	for(i=0; pid && i<count; i++)
-	{
-		sprintf(m, "[%d:%d] %s", pid, i, msg);
-		if(sq_put(queue, m, strlen(m))<0)
-		{
-			printf("put msg[%d] failed: %s\n", i, sq_errorstr(queue));
-			return;
-		}
-	}
-	if(pid) exit(0);
-	while(wait(NULL)>0);
-	printf("put successfully\n");
-}
-
-void test_get(struct shm_queue *queue, int proc_count, int count)
-{
-	int i;
-	int pid = 0;
-
-	for(i=1; i<=proc_count; i++)
-	{
-		if(fork()==0)
-		{
-			pid=i;
-			break;
-		}
-	}
-
-	if(pid)
-	{
-		// Note: each process has a uniq event fd, which is bond to process id
-		// If your server forks several processes, this function should be called after fork()
-		int event_fd = sq_get_eventfd(queue);
-		printf("child %d event_fd=%d\n", pid, event_fd);
-
-		for(i=0; i<count; i++)
-		{
-			fd_set fdset;
-			FD_ZERO(&fdset);
-			FD_SET(event_fd, &fdset);
-			struct timeval to;
-			to.tv_sec = 100;
-			to.tv_usec = 0;
-
-			sq_sigon(queue); // now we are entering into sleeping sys call
-			int ret = select(event_fd+1, &fdset, NULL, NULL, &to);
-			sq_sigoff(queue); // no longer needs signal
-			if(ret<0)
-			{
-				printf("select failed: %s\n", strerror(errno));
-				continue;
-			}
-
-			if(FD_ISSET(event_fd, &fdset))
-				sq_consume_event(queue);
-
-			struct timeval tv;
-			int l = sq_get(queue, m, sizeof(m), &tv);
-			if(l<0)
-			{
-				printf("sq_get failed: %s\n", sq_errorstr(queue));
-				break;
-			}
-			if(l==0)// no data
-			{
-				i --;
-				continue;
-			}
-			// if we are able to retrieve data from queue, always
-			// try it without sleeping
-			m[l] = 0;
-			printf("pid[%d] msg[%d] len[%d]: %s\n", pid, i, l, m);
-		}
-		exit(0);
-	}
-	while(wait(NULL)>0);
-}
-
-void press_test(struct shm_queue *queue, uint32_t record_count, uint32_t record_size)
-{
-	struct timeval tv;
-	int put_count=0,get_count=0;
-	for(; put_count<record_count; )
-	{
-		while(put_count<record_count && sq_put(queue, m, record_size)==0) put_count ++;
-		while(sq_get(queue, m, sizeof(m), &tv)>0) get_count ++;
-	}
-	printf("put %u, get %u finished\n", put_count, get_count);
-}
-
-int main(int argc, char *argv[])
-{
-	struct shm_queue *queue;
-	long key;
-
-	if(argc<3)
-	{
-badarg:
-		printf("usage: \n");
-		printf("     %s open <key>\n", argv[0]);
-		printf("     %s create <key> <element_size> <element_count>\n", argv[0]);
-		printf("     %s press <key> <record_count> <record_size>\n", argv[0]);
-		printf("\n");
-		return -1;
-	}
-
-	if(strncasecmp(argv[2], "0x", 2)==0)
-		key = strtoul(argv[2]+2, NULL, 16);
-	else
-		key = strtoul(argv[2], NULL, 10); 
-
-	if(strcmp(argv[1], "open")==0 || strcmp(argv[1], "press")==0)
-	{
-		queue = sq_open(key);
-	}
-	else if(strcmp(argv[1], "create")==0 && argc==5)
-	{
-		queue = sq_create(key, strtoul(argv[3], NULL, 10), strtoul(argv[4], NULL, 10), 1, 2);
-	}
-	else
-	{
-		goto badarg;
-	}
-
-	if(queue==NULL)
-	{
-		printf("failed to open shm queue: %s\n", sq_errorstr(NULL));
-		return -1;
-	}
-
-	if(strcmp(argv[1], "press")==0)
-	{
-		if(argc!=5) goto badarg;
-		press_test(queue, strtoul(argv[3], NULL, 10), strtoul(argv[4], NULL, 10));
-		return 0;
-	}
-
-	while(1)
-	{
-		static char cmd[1024*1024];
-		printf("available commands: \n");
-		printf("  put <concurrent_proc_count> <msg_count> <msg>\n");
-		printf("  get <concurrent_proc_count> <msg_count>\n");
-		printf("  quit\n");
-		printf("cmd>"); fflush(stdout);
-		if(gets(cmd)==NULL)
-			return 0;
-		if(strncmp(cmd, "put ", 4)==0)
-		{
-			char *pstr = cmd + 4;
-			while(isspace(*pstr)) pstr ++;
-			int proc_count = atoi(pstr);
-			if(proc_count<1) proc_count = 1;
-			while(isdigit(*pstr)) pstr ++;
-			while(isspace(*pstr)) pstr ++;
-			int count = atoi(pstr);
-			if(count<1) count = 1;
-			while(isdigit(*pstr)) pstr ++;
-			while(isspace(*pstr)) pstr ++;
-			test_put(queue, proc_count, count, pstr);
-		}
-		else if(strncmp(cmd, "get ", 4)==0)
-		{
-			char *pstr = cmd + 4;
-			while(isspace(*pstr)) pstr ++;
-			int proc_count = atoi(pstr);
-			if(proc_count<1) proc_count = 1;
-			while(isdigit(*pstr)) pstr ++;
-			while(isspace(*pstr)) pstr ++;
-			int count = atoi(pstr);
-			if(count<1) count = 1;
-			test_get(queue, proc_count, count);
-		}
-		else if(strncmp(cmd, "quit", 4)==0 || strncmp(cmd, "exit", 4)==0)
-		{
-			return 0;
-		}
-	}
-	return 0;
-}
-
-#endif
