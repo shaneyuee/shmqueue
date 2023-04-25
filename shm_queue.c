@@ -41,7 +41,7 @@
 #define TOKEN_HAS_DATA   0x0000db03 // token to mark the valid start of a node
 
 #define SQ_MAX_READER_PROC_NUM	64 // maximum allowable processes to be signaled when data arrives
-#define SQ_MAX_CONFLICT_TRIES	10 // maximum number of reading attempts for read-write conflict detection
+#define SQ_MAX_CONFLICT_TIME_MS 50 // maximum time span in ms for reading attempts for read-write conflict detection
 
 #if defined(__x86_64__) || defined(__x86_32__)
 #define CAS32(ptr, val_old, val_new)({ char ret; __asm__ __volatile__("lock; cmpxchgl %2,%0; setz %1": "+m"(*ptr), "=q"(ret): "r"(val_new),"a"(val_old): "memory"); ret;})
