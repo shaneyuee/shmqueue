@@ -116,6 +116,12 @@ void sq_destroy_and_remove(struct shm_queue *queue);
 //     -2 - shm queue is full
 int sq_put(struct shm_queue *queue, void *data, int datalen);
 
+// Add data to end of shm queue, wait as long as time_ms if queue is full
+// Returns 0 on success or
+//     -1 - invalid parameter
+//     -2 - shm queue is full after timeout occurs
+int sq_put_wait(struct shm_queue *sq, void *data, int datalen, long long time_ms);
+
 // Retrieve data
 // On success, buf is filled with the first queue data
 // this function is multi-thread/multi-process safe
