@@ -945,3 +945,36 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 	return datalen;
 }
 
+// Add data to end of shm queue, wait as long as time_ms if queue is full
+// Returns 0 on success or
+//     -1 - invalid parameter
+//     -2 - shm queue is full after timeout occurs
+int sq_put_wait(struct shm_queue *sq, void *data, int datalen, long long time_ms)
+{
+    if (time_ms <= 0)
+        return sq_put(sq, data, datalen);
+    int ret = 0;
+
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+
+    while (ret != -2) // full
+    {
+        ret = sq_put(sq, data, datalen);
+        if (ret != -2)
+            return ret;
+
+        struct timeval tv2;
+        gettimeofday(&tv2, NULL);
+        long long diff = ((tv2.tv_sec - tv.tv_sec) * 1000) + ((tv2.tv_usec - tv.tv_usec) / 1000);
+        printf("tv1=%lu:%lu, tv2=%lu:%lu, diff=%lu, time_ms=%lu\n", tv.tv_sec, tv.tv_usec, tv2.tv_sec, tv2.tv_usec, diff, time_ms);
+        if (diff > time_ms)
+            return -2;
+
+        ret = 0;
+        usleep(1000); // sleep 1ms
+    }
+
+    return ret;
+}
+
