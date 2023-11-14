@@ -376,9 +376,9 @@ static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 	if(pShmId && *pShmId > 0)
 		shmid = *pShmId;
 
-	if(shmid==0 && (shmid=shmget(iKey, 0, 0)) < 0)
+	if(shmid==0 && ((iKey && (shmid=shmget(iKey, 0, 0)) < 0) || iKey==0))
 	{
-		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0 || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0)
+		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0 || (iKey && (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0))
 		{
 			printf("shmget(key=%ld, size=%ld, create=%d): %s\n", iKey, iSize, creating, strerror(errno));
 			return NULL;
