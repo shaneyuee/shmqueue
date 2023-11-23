@@ -6,6 +6,7 @@ import (
 	"os"
 	"shmqueue"
 	"strconv"
+	"strings"
 	"time"
 	"unsafe"
 )
@@ -107,6 +108,8 @@ func main() {
     for {
         result, err := reader.ReadString('\n');
         if err != nil { break }
+
+	result = strings.Replace(result, "\n", "", -1)
 
         if result == "read" {
             ret, t := shmqueue.SQGet(shmq, buf)
