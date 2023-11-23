@@ -1,12 +1,13 @@
 **[中文描述]**
 
-一个基于CAS的无锁共享内存队列的实现，使用fifo进行事件通知，消费方可以同时轮询网络socket FD和队列生成的FIFO FD，满足实时性的消费需求。
+一个基于CAS的无锁共享内存队列的实现，在Linux下可以使用fifo进行事件通知，消费方可以同时轮询网络socket FD和队列生成的FIFO FD，满足实时性的消费需求。
 
  **特点**：
  
   -   1，高性能，实测800w/s以上；
   -   2，实时通知，可用epoll侦听；
   -   3，高并发，支持同时多写多读。
+  -   4，支持多语言、多平台，目前可以支持Go语言，也可以在windows运行。
 
  **主要功能**：
  
@@ -20,7 +21,9 @@
 
 **[English Description]**
 
-This is a very fast lock-free generic data queue implemented based on share memory (shm), it is lock-free so that multiple writers and readers can access the same queue synchronously without need of locking.
+This is a very fast lock-free generic data queue implemented based on share memory (Linux shmget/shmat API, Windows CreateFileMapping/OpenFileMapping API), it is lock-free so that multiple writers and readers can access the same queue synchronously without need of locking.
+
+Now we have supported Windows platform and golang (with cgo wrapper), we will cover more platforms and languages as needed.
 
 **Usage example**
 

@@ -23,11 +23,6 @@
 #define NULL 0
 #endif
 
-// Switch on this macro for compiling a test program
-#ifndef SQ_FOR_TEST
-#define SQ_FOR_TEST	0
-#endif
-
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -51,12 +46,12 @@ struct shm_queue;
 
 // Create a shm queue
 // Parameters:
-//     shm_key      - shm key, may be IPC_PRIVATE for anonymous shm
+//     shm_key      - shm key, may be IPC_PRIVATE (0) for anonymous shm
 //     ele_size     - preallocated size for each element
 //     ele_count    - preallocated number of elements, this count should be greater than RESERVE_BLOCK_COUNT,
 //                    and the real usable element count is (ele_count-RESERVE_BLOCK_COUNT)
-//     sig_ele_num  - only send signal when data element count exceeds sig_ele_num
-//     sig_proc_num - send signal to up to this number of processes each time
+//     sig_ele_num  - only send signal when data element count exceeds sig_ele_num, non-effective on windows
+//     sig_proc_num - send signal to up to this number of processes each time, non-effective on windows
 // Returns a shm queue pointer or NULL if failed, on failure, call sq_errorstr(NULL) to retrieve the reason.
 struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_ele_num, int sig_proc_num);
 
@@ -81,6 +76,7 @@ struct shm_queue *sq_open_by_shmid(int shm_id);
 // Parameters:
 //      sq  - shm_queue pointer returned by sq_open
 // Returns an event fd for select/polling on success, or < 0 on failure
+// Note: not available on Windows
 int sq_get_eventfd(struct shm_queue *sq);
 
 // Once an event has been received, the user is responsible to call this
@@ -89,11 +85,13 @@ int sq_get_eventfd(struct shm_queue *sq);
 // Parameters:
 //      sq  - shm_queue pointer returned by sq_open
 // Returns 0 on success, or < 0 on failure
+// Note: not available on Windows
 int sq_consume_event(struct shm_queue *sq);
 
-// the same as sq_consume_event(), except that while sq_consume_event()
+// The same as sq_consume_event(), except that while sq_consume_event()
 // consumes up to 64 events at once, the caller can specify the number of
 // events to consume, this is usefull for one-poll-one-get situations
+// Note: not available on Windows
 int sq_consume_event_ext(struct shm_queue *sq, int nr_events);
 
 
@@ -101,6 +99,7 @@ int sq_consume_event_ext(struct shm_queue *sq, int nr_events);
 // Parameters:
 //      sq  - shm_queue pointer returned by sq_open
 // Returns 0 on success, -1 if parameter is bad
+// Note: not available on Windows
 int sq_sigon(struct shm_queue *sq);
 int sq_sigoff(struct shm_queue *sq);
 

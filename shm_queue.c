@@ -12,36 +12,55 @@
  *  2014-07-15  	shaneyu		Use fifo for data notification
  *  2014-07-21		shaneyu		Resolve multiple write conflicts
  *  2022-10-31		shaneyu		Add anonymous shm support
+ *  2023-11-16		shaneyu		Add golang wrapper
+ *  2023-11-23		shaneyu		Add Windows support, please compile with shm_win.h/.c
  */
 #include <stdint.h>
-#include <sys/time.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/mman.h>
 #include <errno.h>
 #include <sys/types.h>
-#include <sys/shm.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <dirent.h>
 #include <signal.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winnt.h>
+#pragma comment(lib, "Kernel32.lib")
+#include "shm_win.h"
+
+#define IPC_CREAT 1
+#define shmget(key, size, flag) shmget_win(key, size, flag)
+#define shmat(id) shmat_win(id)
+#define shmdt(buf) shmdt_win(buf)
+
+typedef struct timeval_win timeval;
+#define opt_gettimeofday gettimeofday_win
+#define gettimeofday gettimeofday_win
+#define opt_time time_win
+
+#define CAS32(ptr, val_old, val_new) (InterlockedCompareExchange(ptr, val_new, val_old)==(val_old))
+#define wmb() MemoryBarrier() //_mm_sfence()
+#define rmb() MemoryBarrier() // _mm_lfence()
+
+typedef int pid_t;
+
+#else
+#include <sys/time.h>
+#include <sys/mman.h>
+#include <dirent.h>
 #include <unistd.h>
 #include <sys/file.h>
-#include "shm_queue.h"
+#include <sys/shm.h>
+
 #if defined(__x86_64__) || defined(__x86_32__)
 #include "opt_time.h"
 #else
 #define opt_gettimeofday gettimeofday
 #define opt_time time
 #endif
-
-#define TOKEN_NO_DATA    0
-#define TOKEN_SKIPPED    0xdb030000 // token to mark the node is skipped
-#define TOKEN_HAS_DATA   0x0000db03 // token to mark the valid start of a node
-
-#define SQ_MAX_READER_PROC_NUM	64 // maximum allowable processes to be signaled when data arrives
-#define SQ_MAX_CONFLICT_TIME_MS 50 // maximum time span in ms for reading attempts for read-write conflict detection
 
 #if defined(__x86_64__) || defined(__x86_32__)
 #define CAS32(ptr, val_old, val_new)({ char ret; __asm__ __volatile__("lock; cmpxchgl %2,%0; setz %1": "+m"(*ptr), "=q"(ret): "r"(val_new),"a"(val_old): "memory"); ret;})
@@ -52,6 +71,19 @@
 #define wmb() __sync_synchronize()
 #define rmb() __sync_synchronize()
 #endif
+
+#endif
+
+#include "shm_queue.h"
+
+#define TOKEN_NO_DATA    0
+#define TOKEN_SKIPPED    0xdb030000 // token to mark the node is skipped
+#define TOKEN_HAS_DATA   0x0000db03 // token to mark the valid start of a node
+
+#define SQ_MAX_READER_PROC_NUM	64 // maximum allowable processes to be signaled when data arrives
+#define SQ_MAX_CONFLICT_TIME_MS 50 // maximum time span in ms for reading attempts for read-write conflict detection
+
+
 struct sq_head_t;
 
 //
@@ -87,16 +119,26 @@ const char *sq_errorstr(struct shm_queue *sq)
 	return sq? sq->errmsg : errmsg;
 }
 
+#ifdef _WIN32
+#pragma pack(1)
+#endif
 struct sq_node_head_t
 {
-	u32_t start_token; // 0x0000db03, if the head position is corrupted, find next start token
-	u32_t datalen; // length of stored data in this node
-	struct timeval32 enqueue_time;
+	volatile u32_t start_token; // 0x0000db03, if the head position is corrupted, find next start token
+	volatile u32_t datalen; // length of stored data in this node
+	volatile struct timeval32 enqueue_time;
 
 	// the actual data are stored here
+#ifndef _WIN32
 	unsigned char data[0];
-
-} __attribute__((packed));
+#endif
+}
+#ifdef _WIN32
+;
+#pragma pack()
+#else
+__attribute__((packed));
+#endif
 
 struct sq_head_t
 {
@@ -117,8 +159,9 @@ struct sq_head_t
 	volatile int signr[SQ_MAX_READER_PROC_NUM]; // nr of writers waiting on fifo write
 
 	uint8_t reserved[1024*1024*4]; // 4MB of reserved space
-
+#ifndef _WIN32
 	struct sq_node_head_t nodes[0];
+#endif
 };
 
 // Increase head/tail by val
@@ -145,13 +188,18 @@ struct sq_head_t
 #define SQ_NODE_SIZE(queue)            	(SQ_NODE_SIZE_ELEMENT((queue)->ele_size))
 
 // Convert an index to a node_head pointer
+#ifdef _WIN32
+#define SQ_GET(queue, idx) ((struct sq_node_head_t *)(((char*)((queue)->reserved+sizeof((queue)->reserved))) + (idx)*SQ_NODE_SIZE(queue)))
+#else
 #define SQ_GET(queue, idx) ((struct sq_node_head_t *)(((char*)(queue)->nodes) + (idx)*SQ_NODE_SIZE(queue)))
+#endif
 
 // Estimate how many nodes are needed by this length
 #define SQ_NUM_NEEDED_NODES(queue, datalen) 	((datalen) + sizeof(struct sq_node_head_t) + SQ_NODE_SIZE(queue) -1) / SQ_NODE_SIZE(queue)
 
 static inline int is_pid_valid(pid_t pid)
 {
+#ifndef _WIN32
 	if(pid==0) return 0;
 
 	char piddir[256];
@@ -160,6 +208,7 @@ static inline int is_pid_valid(pid_t pid)
 	if(d==NULL)
 		return 0;
 	closedir(d);
+#endif
 	return 1;
 }
 
@@ -170,22 +219,30 @@ static inline int is_pid_valid(pid_t pid)
 // Returns 0 on success, -1 if parameter is bad
 static int sq_set_sig_on(struct sq_head_t *sq, int sigindex)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	if((uint32_t)sigindex<(uint32_t)sq->pidnum)
 	{
 		__sync_fetch_and_or(sq->sigmask+(sigindex/8), (uint8_t)1<<(sigindex%8));
 		return 0;
 	}
 	return -1;
+#endif
 }
 
 static int sq_set_sig_off(struct sq_head_t *sq, int sigindex)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	if((uint32_t)sigindex<(uint32_t)sq->pidnum)
 	{
 		__sync_fetch_and_and(sq->sigmask+(sigindex/8), (uint8_t)~(1U<<(sigindex%8)));
 		return 0;
 	}
 	return -1;
+#endif
 }
 
 int sq_sigon(struct shm_queue *sq)
@@ -211,12 +268,19 @@ int sq_sigoff(struct shm_queue *sq)
 int sq_get_shmid(struct shm_queue *sq)
 {
 	if (sq == NULL) return -1;
+#ifdef _WIN32
+	return shmgetkey(sq->shm_id);
+#else
 	return sq->shm_id;
+#endif
 }
 
 
 static inline void verify_and_remove_bad_pids(struct sq_head_t *sq)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	int i;
 	int oldpidnum = (int)sq->pidnum;
 	int newpidnum = oldpidnum;
@@ -242,11 +306,15 @@ static inline void verify_and_remove_bad_pids(struct sq_head_t *sq)
 			CAS32(&sq->pidset[i], oldpid, 0); // if conflict occurs, simply ignore it
 		}
 	}
+#endif
 }
 
 
 static int create_fifo(uint64_t shm_key, int idx, BOOL is_reading)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	char fifo[256];
 	snprintf(fifo, sizeof(fifo), "/tmp/shmqueue_fifo_0x%llX_%d", (unsigned long long)shm_key, idx);
 	int ret = mkfifo(fifo, 0666);
@@ -270,6 +338,7 @@ static int create_fifo(uint64_t shm_key, int idx, BOOL is_reading)
 	}
 
 	return ret;
+#endif
 }
 
 // Register the current process ID, so that it will be able to receive signal
@@ -280,6 +349,9 @@ static int create_fifo(uint64_t shm_key, int idx, BOOL is_reading)
 // Returns a signal index for sq_sigon/sq_sigoff, or < 0 on failure
 int sq_get_eventfd(struct shm_queue *queue)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	if(queue->sig_idx>=0 && queue->poll_fd>0)
 		return queue->poll_fd;
 
@@ -342,6 +414,7 @@ ret:
 		return -1;
 	}
 	return queue->poll_fd;
+#endif
 }
 
 int sq_consume_event(struct shm_queue *sq)
@@ -351,6 +424,9 @@ int sq_consume_event(struct shm_queue *sq)
 
 int sq_consume_event_ext(struct shm_queue *sq, int nr_events)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	if(nr_events<=0)
 		nr_events = 64;
 	else if(nr_events>1024)
@@ -364,6 +440,7 @@ int sq_consume_event_ext(struct shm_queue *sq, int nr_events)
 	}
 	snprintf(sq->errmsg, sizeof(sq->errmsg), "bad poll fd");
 	return -1;
+#endif
 }
 
 // shm operation wrapper
@@ -373,20 +450,35 @@ static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 	char* shm;
 
 	// If *pShmId is valid, use it
-	if(pShmId && *pShmId > 0)
+#ifndef _WIN32
+	if(pShmId && *pShmId > 0) // open by shmid
 		shmid = *pShmId;
-
+#else
+	if (pShmId && *pShmId != 0 && !creating) // open private shm
+	{
+		iKey = *pShmId;
+		shmid = shmget_pri_win(iKey, iSize, 0);
+		if (shmid < 0)
+		{
+			printf("shmget_prive(key=%ld, size=%ld, create=%d): error=%d\n", iKey, iSize, creating, GetLastError());
+			return NULL;
+		}
+	}
+	else
+#endif
 	if(shmid==0 && ((iKey && (shmid=shmget(iKey, 0, 0)) < 0) || iKey==0))
 	{
-		if(!creating || (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0 || (iKey && (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0))
+		if(!creating || ((shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0 && (shmid=shmget(iKey, iSize, 0666|IPC_CREAT)) < 0))
 		{
 			printf("shmget(key=%ld, size=%ld, create=%d): %s\n", iKey, iSize, creating, strerror(errno));
 			return NULL;
 		}
+		printf("shm created, key=%ld, size=%ld, create=%d\n", iKey, iSize, creating);
 		created = 1;
 	}
 	else if(creating)
 	{
+#ifndef _WIN32
 		// verify existing size
 		struct shmid_ds ds;
 		if(shmctl(shmid, IPC_STAT, &ds) < 0)
@@ -410,6 +502,7 @@ static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 			}
 			created = 1;
 		}
+#endif
 	}
 
 	if((shm=shmat(shmid, NULL ,0))==(char *)-1)
@@ -418,7 +511,7 @@ static char *attach_shm(long iKey, long iSize, int *bCreate, int *pShmId)
 		return NULL;
 	}
 
-	if (pShmId && shmid != *pShmId)
+	if (pShmId)
 		*pShmId = shmid;
 	*bCreate = created;
 
@@ -491,6 +584,7 @@ static int signal_process(struct shm_queue *sq, int sigidx);
 // Returns 0 on success, < 0 on failure
 static int sq_set_sigparam(struct shm_queue *queue, int sig_ele_num, int sig_proc_num)
 {
+#ifndef _WIN32
 	struct sq_head_t *sq = queue->head;
 	sq->sig_node_num = sig_ele_num;
 	sq->sig_process_num = sig_proc_num;
@@ -511,7 +605,7 @@ static int sq_set_sigparam(struct shm_queue *queue, int sig_ele_num, int sig_pro
 			signal_process(queue, i);
 		}
 	}
-
+#endif
 	return 0;
 }
 
@@ -519,6 +613,7 @@ static int sq_set_sigparam(struct shm_queue *queue, int sig_ele_num, int sig_pro
 
 static int exc_lock(int iUnlocking, int *fd, u64_t shm_key)
 {
+#ifndef _WIN32
 	char sLockFile[256];
 	snprintf(sLockFile, sizeof(sLockFile), "%s_%llu", SQ_LOCK_FILE, (unsigned long long)shm_key);
 
@@ -536,6 +631,7 @@ static int exc_lock(int iUnlocking, int *fd, u64_t shm_key)
 		printf("%s file %s failed: %s\n", iUnlocking? "Unlock":"Lock", SQ_LOCK_FILE, strerror(errno));
 		return -2;
 	}
+#endif
 	return 0;
 }
 
@@ -551,8 +647,9 @@ static int exc_lock(int iUnlocking, int *fd, u64_t shm_key)
 struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_ele_num, int sig_proc_num)
 {
 	int fd = -1;
+#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
-
+#endif
 	exc_lock(0, &fd, shm_key); // lock, if failed, printf and ignore
 
 	struct shm_queue *queue = calloc(1, sizeof(struct shm_queue));
@@ -593,7 +690,9 @@ struct shm_queue *sq_create(u64_t shm_key, int ele_size, int ele_count, int sig_
 // Open an existing shm queue for reading data
 struct shm_queue *sq_open(u64_t shm_key)
 {
+#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	struct shm_queue *queue = calloc(1, sizeof(struct shm_queue));
 	if(queue==NULL)
@@ -616,7 +715,9 @@ struct shm_queue *sq_open(u64_t shm_key)
 
 struct shm_queue *sq_open_by_shmid(int shm_id)
 {
+#ifndef _WIN32
 	signal(SIGPIPE, SIG_IGN);
+#endif
 
 	struct shm_queue *queue = calloc(1, sizeof(struct shm_queue));
 	if(queue==NULL)
@@ -624,6 +725,7 @@ struct shm_queue *sq_open_by_shmid(int shm_id)
 		snprintf(errmsg, sizeof(errmsg), "Out of memory");
 		return NULL;
 	}
+
 	queue->shm_key = 0;
 	queue->sig_idx = -1;
 	queue->shm_id = shm_id;
@@ -642,6 +744,10 @@ struct shm_queue *sq_open_by_shmid(int shm_id)
 void sq_destroy(struct shm_queue *queue)
 {
 	shmdt(queue->head);
+#ifdef _WIN32
+	shmclose_win(queue->shm_id);
+#endif
+
 	free(queue);
 }
 
@@ -649,13 +755,20 @@ void sq_destroy(struct shm_queue *queue)
 void sq_destroy_and_remove(struct shm_queue *queue)
 {
 	shmdt(queue->head);
+#ifdef _WIN32
+	shmclose_win(queue->shm_id);
+#else
 	shmctl(queue->shm_id, IPC_RMID, 0);
+#endif
 	free(queue);
 }
 
 
 static int signal_process(struct shm_queue *sq, int sigidx)
 {
+#ifdef _WIN32
+	return 0;
+#else
 	if(sq->poll_fdset[sigidx]<=0)
 	{
 		// avoid constant fifo creation, in case create_fifo() fails every time
@@ -685,6 +798,7 @@ static int signal_process(struct shm_queue *sq, int sigidx)
 		return 0;
 	}
 	return -1;
+#endif
 }
 
 
@@ -764,7 +878,7 @@ int sq_put(struct shm_queue *sq, void *data, int datalen)
 		opt_gettimeofday(&tv, NULL);
 		node->enqueue_time.tv_sec = tv.tv_sec;
 		node->enqueue_time.tv_usec = tv.tv_usec;
-		memcpy(node->data, data, datalen);
+		memcpy(node+1, data, datalen);
 		node->start_token = TOKEN_HAS_DATA; // mark data ready for reading
 		wmb(); // sync write with other processors
 		break;
@@ -912,7 +1026,7 @@ int sq_get(struct shm_queue *sq, void *buf, int buf_sz, struct timeval *enqueue_
 			sq->rw_conflict_time = 0;
 			return -2;
 		}
-		memcpy(buf, node->data, datalen);
+		memcpy(buf, node+1, datalen);
 
 		new_head = SQ_ADD_POS(queue, head, nr_nodes);
 		if(CAS32(&queue->head_pos, old_head, new_head))
@@ -967,12 +1081,17 @@ int sq_put_wait(struct shm_queue *sq, void *data, int datalen, long long time_ms
         struct timeval tv2;
         gettimeofday(&tv2, NULL);
         long long diff = ((tv2.tv_sec - tv.tv_sec) * 1000) + ((tv2.tv_usec - tv.tv_usec) / 1000);
-        printf("tv1=%lu:%lu, tv2=%lu:%lu, diff=%lu, time_ms=%lu\n", tv.tv_sec, tv.tv_usec, tv2.tv_sec, tv2.tv_usec, diff, time_ms);
+        printf("tv1=%lu:%lu, tv2=%lu:%lu, diff=%lu, time_ms=%lu\n", (unsigned long)tv.tv_sec, (unsigned long)tv.tv_usec, (unsigned long)tv2.tv_sec, (unsigned long)tv2.tv_usec, (unsigned long)diff, (unsigned long)time_ms);
         if (diff > time_ms)
             return -2;
 
         ret = 0;
-        usleep(1000); // sleep 1ms
+		// sleep 1ms
+#ifdef _WIN32
+		Sleep(1);
+#else
+		usleep(1000);
+#endif
     }
 
     return ret;
