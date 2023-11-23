@@ -7,7 +7,7 @@
   -   1，高性能，实测800w/s以上；
   -   2，实时通知，可用epoll侦听；
   -   3，高并发，支持同时多写多读。
-  -   4，支持多语言、多平台，目前可以支持Go语言，也可以在windows运行。
+  -   4，支持多语言、多平台，目前可以支持Go和Python语言，也可以在Windows运行。
 
  **主要功能**：
  
@@ -23,7 +23,7 @@
 
 This is a very fast lock-free generic data queue implemented based on share memory (Linux shmget/shmat API, Windows CreateFileMapping/OpenFileMapping API), it is lock-free so that multiple writers and readers can access the same queue synchronously without need of locking.
 
-Now we have supported Windows platform and golang (with cgo wrapper), we will cover more platforms and languages as needed.
+Now we have supported Windows platform and golang (with cgo wrapper) / python, we will cover more platforms and languages as needed.
 
 **Usage example**
 
